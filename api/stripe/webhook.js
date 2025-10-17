@@ -1,51 +1,107 @@
-// Plain Vercel Node.js Serverless Function (no Next.js config)
-import Stripe from "stripe";
-import fetch from "node-fetch";
+// /api/stripe/webhook.js
+export const config = {
+  api: { bodyParser: false },
+  runtime: 'nodejs18.x'
+};
 
-const readRawBody = (req) =>
-  new Promise((resolve, reject) => {
-    let data = "";
-    req.setEncoding("utf8");
-    req.on("data", (c) => (data += c));
-    req.on("end", () => resolve(data));
-    req.on("error", reject);
+import Stripe from 'stripe';
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+function readBuf(req){
+  return new Promise((resolve, reject)=>{
+    const chunks=[]; req.on('data', c=>chunks.push(c));
+    req.on('end', ()=>resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
   });
+}
 
-export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    return res.status(405).json({ ok: false, error: "Method not allowed" });
+// Duración “live” de servicio por paquete (ajústalo a tu lógica)
+const SERVICE_HOURS = {
+  "50-150-5h": 2,       // servicio en vivo (el título “5h” es nombre comercial)
+  "150-250-5h": 2.5,
+  "250-350-6h": 3
+};
+
+// Si quieres bloquear 1h antes + 1h limpieza, cámbialo aquí:
+const PREP_HOURS   = 1;
+const CLEAN_HOURS  = 1;
+
+export default async function handler(req, res){
+  if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
+
+  let event;
+  try{
+    const buf = await readBuf(req);
+    const sig = req.headers['stripe-signature'];
+    event = stripe.webhooks.constructEvent(buf, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  }catch(e){
+    console.error('Bad signature', e.message);
+    return res.status(400).send(`Webhook Error: ${e.message}`);
   }
 
-  const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
-    apiVersion: "2024-06-20",
-  });
+  try{
+    if (event.type === 'checkout.session.completed'){
+      const session = event.data.object;
+      const md = session.metadata || {};
 
-  try {
-    const raw = await readRawBody(req);
-    const sig = req.headers["stripe-signature"];
-    const event = stripe.webhooks.constructEvent(
-      raw,
-      sig,
-      process.env.STRIPE_WEBHOOK_SECRET
-    );
+      // ===== Crea evento en Google Calendar (Service Account) =====
+      try{
+        const { google } = await import('googleapis');
+        const sa = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '{}');
+        const jwt = new google.auth.JWT(
+          sa.client_email,
+          null,
+          sa.private_key,
+          ['https://www.googleapis.com/auth/calendar']
+        );
+        const calendar = google.calendar({ version: 'v3', auth: jwt });
 
-    // optionally forward to Apps Script
-    const gasUrl = (process.env.GAS_URL || "").trim();
-    if (event.type === "checkout.session.completed" && gasUrl) {
-      try {
-        await fetch(gasUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ source: "stripe", event }),
+        const tz = process.env.TIMEZONE || 'America/Los_Angeles';
+
+        // Construye ventana: 1h antes + live + 1h limpieza
+        const startLiveISO = md.startISO ? new Date(md.startISO) : null;
+        let startISO = null, endISO = null;
+        if (startLiveISO){
+          const live = SERVICE_HOURS[md.pkg] || 2;
+          const start = new Date(startLiveISO.getTime() - PREP_HOURS * 3600e3);
+          const end   = new Date(startLiveISO.getTime() + (live * 3600e3) + CLEAN_HOURS * 3600e3);
+          startISO = start.toISOString();
+          endISO   = end.toISOString();
+        }
+
+        const summary = `Manna — ${md.mainBar || 'Snack Bar'} (${md.pkg || ''})`;
+        const description = [
+          `Client: ${md.fullName} (${md.email}) ${md.phone ? '• ' + md.phone : ''}`,
+          `Venue: ${md.venue || '-'}`,
+          `Setup: ${md.setup || '-'} • Power: ${md.power || '-'}`,
+          `Payment: ${md.payMode} — Charged ${md.dueNow} / Total ${md.total}`
+        ].join('\n');
+
+        await calendar.events.insert({
+          calendarId: process.env.CALENDAR_ID || 'primary',
+          requestBody: {
+            summary,
+            description,
+            start: startISO ? { dateTime: startISO, timeZone: tz } : undefined,
+            end:   endISO   ? { dateTime: endISO,   timeZone: tz } : undefined,
+            guestsCanInviteOthers: false,
+            guestsCanSeeOtherGuests: true,
+          }
         });
-      } catch (e) {
-        console.error("GAS forward failed:", e.message);
+      }catch(e){
+        console.error('Calendar insert failed', e.message);
       }
+
+      return res.json({ received: true, ok: true });
     }
 
-    return res.status(200).json({ received: true });
-  } catch (err) {
-    console.error("Webhook error:", err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
+    if (event.type === 'checkout.session.expired'){
+      return res.json({ received: true, expired: true });
+    }
+
+    return res.json({ received: true });
+  }catch(e){
+    console.error('webhook handler error', e);
+    return res.status(500).send('Webhook handler failed');
   }
 }
