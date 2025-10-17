@@ -1,13 +1,19 @@
 {
   "name": "manna-webhooks",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=18" },
-  "dependencies": {
-    "stripe": "^14.0.0",
-    "node-fetch": "^3.3.2"
+  "description": "Stripe checkout + webhooks + Google Calendar (serverless on Vercel)",
+  "engines": {
+    "node": ">=18"
   },
   "scripts": {
-    "start": "node api/stripe/webhook.js"
+    "dev": "vercel dev",
+    "build": "echo \"Serverless (no build)\"",
+    "start": "vercel dev"
+  },
+  "dependencies": {
+    "googleapis": "^131.0.0",
+    "stripe": "^14.0.0"
   }
 }
