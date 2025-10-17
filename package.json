@@ -1,0 +1,13 @@
+{
+  "name": "manna-webhooks",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "stripe": "^14.0.0",
+    "node-fetch": "^3.3.2"
+  },
+  "scripts": {
+    "start": "node api/stripe/webhook.js"
+  }
+}
