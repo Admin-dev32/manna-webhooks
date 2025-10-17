@@ -1,8 +1,0 @@
-{
-  "installCommand": "npm install --no-audit --no-fund",
-  "buildCommand": "",
-  "framework": null,
-  "functions": {
-    "api/**/*.js": { "runtime": "nodejs20.x" }
-  }
-}
