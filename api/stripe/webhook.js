@@ -1,8 +1,9 @@
 // /api/stripe/webhook.js
 export const config = {
-  api: { bodyParser: false },
-  runtime: 'nodejs'
+  runtime: 'nodejs',
+  maxDuration: 60 // optional
 };
+
 
 import Stripe from 'stripe';
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
