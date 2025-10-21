@@ -1,5 +1,5 @@
 // /api/availability.js
-export const config = { runtime: 'nodejs18.x' };
+export const config = { runtime: 'nodejs' };   // valid on Vercel
 
 const HOURS_RANGE = { start: 9, end: 22 }; // 9am–10pm
 
