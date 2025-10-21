@@ -1,7 +1,7 @@
 // /api/stripe/webhook.js
 export const config = {
   api: { bodyParser: false },
-  runtime: 'nodejs18.x'
+  runtime: 'nodejs'
 };
 
 import Stripe from 'stripe';
