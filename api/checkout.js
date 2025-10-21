@@ -1,7 +1,8 @@
 // /api/checkout.js
 // Crea una sesión de Stripe Checkout calculando los importes con tu misma lógica.
 
-export const config = { runtime: 'nodejs18.x' };
+export const config = { runtime: 'nodejs' };   // valid on Vercel
+
 
 import Stripe from 'stripe';
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
