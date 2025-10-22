@@ -2,19 +2,8 @@
 export const config = { runtime: 'nodejs', maxDuration: 60 };
 
 import Stripe from 'stripe';
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2023-10-16' });
 
-// horas “en vivo” por paquete (igual que antes)
-const SERVICE_HOURS = {
-  '50-150-5h': 2,
-  '150-250-5h': 2.5,
-  '250-350-6h': 3,
-};
-
-const PREP_HOURS = 1;
-const CLEAN_HOURS = 1;
-
-// ——— helpers ———
 function readBuf(req){
   return new Promise((resolve, reject)=>{
     const chunks=[]; req.on('data', c=>chunks.push(c));
@@ -22,27 +11,29 @@ function readBuf(req){
     req.on('error', reject);
   });
 }
-function titleFor(key){
-  return ({
-    pancake: 'Mini Pancake',
-    esquites: 'Esquites',
-    maruchan: 'Maruchan',
-    tostiloco: 'Tostiloco (Premium)'
-  }[key]) || 'Snack Bar';
-}
-function emojiFor(key){
-  return ({
-    pancake: '🥞',
-    esquites: '🌽',
-    maruchan: '🍜',
-    tostiloco: '🌶️'
-  }[key]) || '🍽️';
-}
+
+// Live service length by package (hrs)
+const SERVICE_HOURS = {
+  '50-150-5h': 2,
+  '150-250-5h': 2.5,
+  '250-350-6h': 3
+};
+
+// 1h buffer before + 1h cleaning after
+const PREP_HOURS  = 1;
+const CLEAN_HOURS = 1;
+
+// Emojis per bar (for calendar summary)
+const EMOJI_BY_BAR = {
+  pancake: '🥞',
+  esquites: '🌽',
+  maruchan: '🍜',
+  tostiloco: '🌶️'
+};
 
 export default async function handler(req, res){
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
-  // Verificar firma de Stripe con body crudo
   let event;
   try{
     const buf = await readBuf(req);
@@ -54,24 +45,18 @@ export default async function handler(req, res){
   }
 
   try{
+    console.log('[WEBHOOK] type =', event.type);
+
     if (event.type === 'checkout.session.completed'){
       const session = event.data.object;
       const md = session.metadata || {};
+      console.log('[WEBHOOK] metadata =', md);
 
-      // Requisitos mínimos
-      if (!md.startISO || !md.pkg){
-        console.error('[WEBHOOK] missing startISO/pkg in metadata');
-        return res.json({ received: true, missingMetadata: true });
-      }
-
-      // Google service account listo
-      if (!process.env.GOOGLE_SERVICE_ACCOUNT_JSON){
-        console.error('[WEBHOOK] GOOGLE_SERVICE_ACCOUNT_JSON missing');
-        return res.json({ received: true, noGoogle: true });
-      }
-
-      // === Calendar insert (esperamos a que termine para ver errores en logs) ===
-      await createCalendarEvent(md);
+      // Fire-and-forget calendar create (don’t slow Stripe)
+      createCalendarEvent(md).then(
+        ()=> console.log('[WEBHOOK] calendar created OK'),
+        (err)=> console.error('[WEBHOOK] calendar create FAILED:', err?.message || err)
+      );
 
       return res.json({ received: true, ok: true });
     }
@@ -82,7 +67,7 @@ export default async function handler(req, res){
 
     return res.json({ received: true });
   }catch(e){
-    console.error('[WEBHOOK] error:', e);
+    console.error('[WEBHOOK] handler error:', e);
     return res.status(500).send('Webhook handler failed');
   }
 }
@@ -90,7 +75,7 @@ export default async function handler(req, res){
 async function createCalendarEvent(md){
   const { google } = await import('googleapis');
 
-  // Parse y normaliza el service account
+  // Read service account JSON from env; fix \n in private key if needed
   const saRaw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '{}';
   const sa = JSON.parse(saRaw);
   if (sa.private_key) sa.private_key = sa.private_key.replace(/\\n/g, '\n');
@@ -106,32 +91,41 @@ async function createCalendarEvent(md){
   const tz = process.env.TIMEZONE || 'America/Los_Angeles';
   const calId = process.env.CALENDAR_ID || 'primary';
 
-  // Ventana: 1h antes + live + 1h limpieza
+  // Build event window: prep + live + clean
+  if (!md.startISO) {
+    throw new Error('No startISO in metadata (can’t build calendar window)');
+  }
   const startLive = new Date(md.startISO);
-  const live = SERVICE_HOURS[md.pkg] ?? 2;
-  const start = new Date(startLive.getTime() - PREP_HOURS * 3600e3);
-  const end   = new Date(startLive.getTime() + live * 3600e3 + CLEAN_HOURS * 3600e3);
+  const liveHrs   = SERVICE_HOURS[md.pkg] ?? 2;
+  const startISO  = new Date(startLive.getTime() - PREP_HOURS * 3600e3).toISOString();
+  const endISO    = new Date(startLive.getTime() + (liveHrs * 3600e3) + CLEAN_HOURS * 3600e3).toISOString();
 
-  // 👇 ÚNICO cambio visible: emojis en el summary
-  const summary = `${emojiFor(md.mainBar)} Manna — ${titleFor(md.mainBar)} (${md.pkg})`;
+  const emoji   = EMOJI_BY_BAR[md.mainBar] || '🍽️';
+  const summary = `Manna — ${emoji} ${md.mainBar || 'Snack Bar'} (${md.pkg || ''})`;
 
-  const description = [
-    `Cliente: ${md.fullName || ''} (${md.email || ''})${md.phone ? ' • ' + md.phone : ''}`,
+  const lines = [
+    `Client: ${md.fullName || ''} (${md.email || ''})${md.phone ? ' • ' + md.phone : ''}`,
     `Venue: ${md.venue || '-'}`,
     `Setup: ${md.setup || '-'} • Power: ${md.power || '-'}`,
-    md.payMode ? `Pago: ${md.payMode} — Cobrado ${md.dueNow} / Total ${md.total}` : null
-  ].filter(Boolean).join('\n');
+    md.payMode ? `Payment: ${md.payMode} — Charged ${md.dueNow || ''} / Total ${md.total || ''}` : null
+  ].filter(Boolean);
+  const description = lines.join('\n');
 
-  // Sin colorId, sin attendees, sin sendUpdates (máxima compatibilidad)
+  const attendees = md.email ? [{ email: md.email, displayName: md.fullName || '' }] : [];
+
+  // Optional: colorId "11" = bold green, pick what you like (1..11)
   await calendar.events.insert({
-  calendarId: calId,
-  requestBody: {
-    summary,
-    description,
-    start: { dateTime: start.toISOString(), timeZone: tz },
-    end:   { dateTime: end.toISOString(),   timeZone: tz },
-    attendees: md.email ? [{ email: md.email, displayName: md.fullName || undefined }] : undefined,
-    sendUpdates: md.email ? "all" : undefined
-  }
-});
+    calendarId: calId,
+    requestBody: {
+      summary,
+      description,
+      colorId: '11',
+      start: { dateTime: startISO, timeZone: tz },
+      end:   { dateTime: endISO,   timeZone: tz },
+      attendees,
+      sendUpdates: 'all',
+      guestsCanInviteOthers: false,
+      guestsCanSeeOtherGuests: true
+    }
+  });
 }
