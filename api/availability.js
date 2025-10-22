@@ -1,7 +1,11 @@
 // /api/availability.js
-export const config = { runtime: 'nodejs' };   // valid on Vercel
+export const config = { runtime: 'nodejs' };
 
 const HOURS_RANGE = { start: 9, end: 22 }; // 9am–10pm
+
+// make these configurable, but default to 1h + 1h
+const PREP_HOURS  = Number(process.env.PREP_HOURS  ?? 1);
+const CLEAN_HOURS = Number(process.env.CLEAN_HOURS ?? 1);
 
 function zonedStartISO(ymd, hour, tz){
   const [y,m,d] = ymd.split('-').map(Number);
@@ -13,8 +17,11 @@ function zonedStartISO(ymd, hour, tz){
 }
 
 export default async function handler(req, res){
-  // CORS simple
-  const allow = (process.env.ALLOWED_ORIGINS || '').split(',').map(s=>s.trim()).filter(Boolean);
+  // CORS
+  const allow = (process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map(s=>s.trim())
+    .filter(Boolean);
   const origin = req.headers.origin || '';
   const okOrigin = allow.length ? allow.includes(origin) : true;
 
@@ -25,6 +32,10 @@ export default async function handler(req, res){
     res.setHeader('Vary', 'Origin');
     return res.status(204).end();
   }
+  if (req.method !== 'GET'){
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
   res.setHeader('Access-Control-Allow-Origin', okOrigin ? origin : '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -32,30 +43,26 @@ export default async function handler(req, res){
 
   try{
     const { date, hours } = req.query || {};
-    const tz = process.env.TIMEZONE || 'America/Los_Angeles';
-    const calId = process.env.CALENDAR_ID || 'primary';
-    const liveHours = Math.max(1, parseFloat(hours || '2')); // 2, 2.5, 3…
-
     if (!date) return res.status(400).json({ error: 'date required (YYYY-MM-DD)' });
 
-  // Auth service account
-const { google } = await import('googleapis');
-const saRaw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '{}';
-const sa = JSON.parse(saRaw);
-// normaliza \n
-if (sa.private_key) sa.private_key = sa.private_key.replace(/\\n/g, '\n');
+    const tz   = process.env.TIMEZONE || 'America/Los_Angeles';
+    const calId = process.env.CALENDAR_ID || 'primary';
+    const liveHours = Math.max(1, parseFloat(hours || '2'));
 
-const jwt = new google.auth.JWT(
-  sa.client_email,
-  null,
-  sa.private_key,
-  ['https://www.googleapis.com/auth/calendar']
-);
-const calendar = google.calendar({ version: 'v3', auth: jwt });
+    // Auth service account
+    const { google } = await import('googleapis');
+    const saRaw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '{}';
+    const sa = JSON.parse(saRaw);
+    if (sa.private_key) sa.private_key = sa.private_key.replace(/\\n/g, '\n');
 
+    const jwt = new google.auth.JWT(
+      sa.client_email, null, sa.private_key,
+      ['https://www.googleapis.com/auth/calendar']
+    );
+    const calendar = google.calendar({ version: 'v3', auth: jwt });
 
-    // Carga eventos de todo el día para cruzar choques
-    const dayStart = zonedStartISO(date, 0, tz);
+    // Load day events
+    const dayStart = zonedStartISO(date, 0,  tz);
     const dayEnd   = zonedStartISO(date, 23, tz);
     const rsp = await calendar.events.list({
       calendarId: calId,
@@ -75,13 +82,12 @@ const calendar = google.calendar({ version: 'v3', auth: jwt });
       const startIso = zonedStartISO(date, h, tz);
       const start = new Date(startIso);
 
-      // No ofrecer horas en el pasado
-      const now = new Date();
-      if (start < now) continue;
+      // skip past times
+      if (start < new Date()) continue;
 
-      // Bloque a checar: 1h antes + live + 1h limpieza
-      const blockStart = new Date(start.getTime() - PREP_HOURS*3600e3);
-      const blockEnd   = new Date(start.getTime() + (liveHours*3600e3) + CLEAN_HOURS*3600e3);
+      // Window to check: prep + live + clean
+      const blockStart = new Date(start.getTime() - PREP_HOURS * 3600e3);
+      const blockEnd   = new Date(start.getTime() + (liveHours * 3600e3) + CLEAN_HOURS * 3600e3);
 
       const overlaps = events.some(ev => !(ev.end <= blockStart || ev.start >= blockEnd));
       if (!overlaps) slots.push({ startISO: startIso });
