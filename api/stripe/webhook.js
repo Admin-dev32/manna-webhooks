@@ -4,7 +4,7 @@ export const config = { runtime: 'nodejs' };
 import Stripe from 'stripe';
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-// ====== Your price table (unchanged) ======
+// ====== Pricing (same totals as your widget) ======
 const BASE_PRICES = { "50-150-5h": 550, "150-250-5h": 700, "250-350-6h": 900 };
 const SECOND_DISCOUNT = { "50-150-5h": 50, "150-250-5h": 75, "250-350-6h": 100 };
 const FOUNTAIN_PRICE = { "50": 350, "100": 450, "150": 550 };
@@ -12,17 +12,17 @@ const FOUNTAIN_WHITE_UPCHARGE = 50;
 const DISCOUNT_FULL = 0.05;
 
 const BAR_META = {
-  pancake:   { title: "🥞 Mini Pancake",  priceAdd: 0 },
-  esquites:  { title: "🌽 Esquites",      priceAdd: 0 },
-  maruchan:  { title: "🍜 Maruchan",      priceAdd: 0 },
-  tostiloco: { title: "🌶️ Tostiloco (Premium)", priceAdd: 50 }
+  pancake:   { title: "🥞 Mini Pancake Bar",  priceAdd: 0 },
+  esquites:  { title: "🌽 Esquite Bar",       priceAdd: 0 },
+  maruchan:  { title: "🍜 Maruchan Bar",      priceAdd: 0 },
+  tostiloco: { title: "🌶️ Tostiloco Bar (Premium)", priceAdd: 50 }
 };
 
-function usd(n){ return Math.round(n * 100); } // cents
+function cents(n){ return Math.round(Number(n) * 100); }
 
 function computeTotals(pb){
   const base0 = BASE_PRICES[pb.pkg] || 0;
-  const addMain = (BAR_META[pb.mainBar]?.priceAdd) || 0;
+  const addMain = BAR_META[pb.mainBar]?.priceAdd || 0;
   const base = base0 + addMain;
 
   let extras = 0;
@@ -38,20 +38,23 @@ function computeTotals(pb){
   }
 
   const total = base + extras;
-
+  // payMode: 'deposit' (25%), 'full' (5% off), 'pay_later' (+3% surcharge, enables Affirm)
   if (pb.payMode === 'full'){
     const save = Math.round(total * DISCOUNT_FULL);
-    return { total, dueNow: total - save, paySavings: save };
+    return { total, dueNow: total - save, savings: save, surcharge: 0, payMethod: 'card' };
+  } else if (pb.payMode === 'pay_later'){
+    const add = Math.round(total * 0.03);
+    return { total, dueNow: total + add, savings: 0, surcharge: add, payMethod: 'affirm' };
   } else {
-    return { total, dueNow: Math.round(total * 0.25), paySavings: 0 };
+    return { total, dueNow: Math.round(total * 0.25), savings: 0, surcharge: 0, payMethod: 'card' };
   }
 }
 
 export default async function handler(req, res){
-  // CORS basic
-  const allowList = (process.env.ALLOWED_ORIGINS || '').split(',').map(s=>s.trim()).filter(Boolean);
+  // Basic CORS
+  const allow = (process.env.ALLOWED_ORIGINS || '').split(',').map(s=>s.trim()).filter(Boolean);
   const origin = req.headers.origin || '';
-  const okOrigin = allowList.length ? allowList.includes(origin) : true;
+  const okOrigin = allow.length ? allow.includes(origin) : true;
 
   if (req.method === 'OPTIONS'){
     res.setHeader('Access-Control-Allow-Origin', okOrigin ? origin : '*');
@@ -69,52 +72,55 @@ export default async function handler(req, res){
 
   try{
     const pb = req.body || {};
-
     if (!pb.pkg || !pb.mainBar || !pb.payMode) {
       return res.status(400).json({ error: 'Missing fields (pkg, mainBar, payMode)' });
     }
 
-    const { total, dueNow } = computeTotals(pb);
+    const { total, dueNow, payMethod } = computeTotals(pb);
 
-    const barTitle = (BAR_META[pb.mainBar]?.title) || 'Snack Bar';
-    const labels = { "50-150-5h":"50–150 (5 hrs)", "150-250-5h":"150–250 (5 hrs)", "250-350-6h":"250–350 (6 hrs)" };
-    const name = `Manna — ${barTitle} • ${labels[pb.pkg] || ''} • ${pb.payMode === 'full' ? 'Pay in full' : '25% deposit'}`;
+    const barTitle = BAR_META[pb.mainBar]?.title || 'Snack Bar';
+    const labels = {
+      "50-150-5h":"50–150 (5 hrs)",
+      "150-250-5h":"150–250 (5 hrs)",
+      "250-350-6h":"250–350 (6 hrs)"
+    };
+    const name = `Manna — ${barTitle} • ${labels[pb.pkg] || ''} • ${
+      pb.payMode === 'deposit' ? '25% deposit'
+        : pb.payMode === 'pay_later' ? 'Get Now, Pay Later (+3%)'
+        : 'Pay in full (5% off)'
+    }`;
+
+    // Allow coupons at checkout, and pre-apply if provided
+    const discounts = [];
+    if (pb.couponCode) {
+      // Try to find a Promotion Code that matches this code
+      const list = await stripe.promotionCodes.list({ code: String(pb.couponCode).trim(), active: true, limit: 1 });
+      const promo = list.data && list.data[0];
+      if (promo && promo.id) discounts.push({ promotion_code: promo.id });
+    }
 
     const successUrl = (process.env.PUBLIC_URL || '') + (process.env.SUCCESS_PATH || '/thank-you') + '?booking={CHECKOUT_SESSION_ID}';
     const cancelUrl  = (process.env.PUBLIC_URL || '') + (process.env.CANCEL_PATH  || '/booking-canceled') + '?booking={CHECKOUT_SESSION_ID}';
 
-    // Try to pre-apply a promotion code if provided
-    let discounts = undefined;
-    if (pb.coupon && String(pb.coupon).trim()){
-      const code = String(pb.coupon).trim();
-      try{
-        const found = await stripe.promotionCodes.list({ code, active: true, limit: 1 });
-        if (found.data && found.data[0]) {
-          discounts = [{ promotion_code: found.data[0].id }];
-        }
-      }catch(e){
-        // silently ignore; Checkout still shows its own promo box
-        console.warn('promo lookup failed', e.message);
-      }
-    }
-
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
-      payment_method_types: ['card'],
-      allow_promotion_codes: true,     // show "Add promotion code" box in Checkout
-      discounts,                       // pre-apply if we found one
+      // users can still add a coupon directly on Stripe Checkout
+      allow_promotion_codes: true,
+      // Enable Affirm when pay_later
+      payment_method_types: payMethod === 'affirm' ? ['card','affirm'] : ['card'],
       line_items: [{
         price_data: {
           currency: 'usd',
           product_data: { name },
-          unit_amount: usd(dueNow)
+          unit_amount: cents(dueNow),
         },
-        quantity: 1
+        quantity: 1,
       }],
+      // apply pre-validated code if any
+      discounts: discounts.length ? discounts : undefined,
       success_url: successUrl,
       cancel_url: cancelUrl,
       metadata: {
-        // keep for webhook
         pkg: pb.pkg,
         mainBar: pb.mainBar,
         payMode: pb.payMode,
@@ -126,8 +132,7 @@ export default async function handler(req, res){
         fountainType: pb.fountainType || '',
         total: String(total),
         dueNow: String(dueNow),
-        coupon: pb.coupon || '',
-
+        // date/time + contact
         dateISO: pb.dateISO || '',
         startISO: pb.startISO || '',
         fullName: pb.fullName || pb.name || '',
