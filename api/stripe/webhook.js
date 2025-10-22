@@ -123,13 +123,15 @@ async function createCalendarEvent(md){
   ].filter(Boolean).join('\n');
 
   // Sin colorId, sin attendees, sin sendUpdates (máxima compatibilidad)
-  return calendar.events.insert({
-    calendarId: calId,
-    requestBody: {
-      summary,
-      description,
-      start: { dateTime: start.toISOString(), timeZone: tz },
-      end:   { dateTime: end.toISOString(),   timeZone: tz }
-    }
-  });
+  await calendar.events.insert({
+  calendarId: calId,
+  requestBody: {
+    summary,
+    description,
+    start: { dateTime: start.toISOString(), timeZone: tz },
+    end:   { dateTime: end.toISOString(),   timeZone: tz },
+    attendees: md.email ? [{ email: md.email, displayName: md.fullName || undefined }] : undefined,
+    sendUpdates: md.email ? "all" : undefined
+  }
+});
 }
