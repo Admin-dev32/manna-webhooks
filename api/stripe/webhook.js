@@ -114,18 +114,19 @@ async function createCalendarEvent(md){
   const attendees = md.email ? [{ email: md.email, displayName: md.fullName || '' }] : [];
 
   // Optional: colorId "11" = bold green, pick what you like (1..11)
-  await calendar.events.insert({
-    calendarId: calId,
-    requestBody: {
-      summary,
-      description,
-      colorId: '11',
-      start: { dateTime: startISO, timeZone: tz },
-      end:   { dateTime: endISO,   timeZone: tz },
-      attendees,
-      sendUpdates: 'all',
-      guestsCanInviteOthers: false,
-      guestsCanSeeOtherGuests: true
-    }
-  });
+ await calendar.events.insert({
+  calendarId: process.env.CALENDAR_ID || 'primary',
+  requestBody: {
+    summary,
+    description,
+    start: startISO ? { dateTime: startISO, timeZone: tz } : undefined,
+    end:   endISO   ? { dateTime: endISO,   timeZone: tz } : undefined,
+
+    // 🔒 Importante: SIN attendees ni sendUpdates
+    // (las cuentas de servicio no pueden invitar sin DWD)
+    guestsCanInviteOthers: false,
+    guestsCanSeeOtherGuests: true
+  }
+});
+
 }
