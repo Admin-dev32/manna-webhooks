@@ -38,13 +38,21 @@ export default async function handler(req, res){
 
     if (!date) return res.status(400).json({ error: 'date required (YYYY-MM-DD)' });
 
-    // Auth service account
-    const { google } = await import('googleapis');
-    const sa = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '{}');
-    const jwt = new google.auth.JWT(sa.client_email, null, sa.private_key, ['https://www.googleapis.com/auth/calendar']);
-    const calendar = google.calendar({ version: 'v3', auth: jwt });
+  // Auth service account
+const { google } = await import('googleapis');
+const saRaw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '{}';
+const sa = JSON.parse(saRaw);
+// normaliza \n
+if (sa.private_key) sa.private_key = sa.private_key.replace(/\\n/g, '\n');
 
-    const PREP_HOURS = 1, CLEAN_HOURS = 1;
+const jwt = new google.auth.JWT(
+  sa.client_email,
+  null,
+  sa.private_key,
+  ['https://www.googleapis.com/auth/calendar']
+);
+const calendar = google.calendar({ version: 'v3', auth: jwt });
+
 
     // Carga eventos de todo el día para cruzar choques
     const dayStart = zonedStartISO(date, 0, tz);
