@@ -4,7 +4,7 @@ export const config = { runtime: 'nodejs' };
 import Stripe from 'stripe';
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-// ====== Pricing (same totals as your widget) ======
+// ====== Pricing ======
 const BASE_PRICES = { "50-150-5h": 550, "150-250-5h": 700, "250-350-6h": 900 };
 const SECOND_DISCOUNT = { "50-150-5h": 50, "150-250-5h": 75, "250-350-6h": 100 };
 const FOUNTAIN_PRICE = { "50": 350, "100": 450, "150": 550 };
@@ -18,7 +18,7 @@ const BAR_META = {
   tostiloco: { title: "🌶️ Tostiloco Bar (Premium)", priceAdd: 50 }
 };
 
-function cents(n){ return Math.round(Number(n) * 100); }
+const toCents = n => Math.round(Number(n) * 100);
 
 function computeTotals(pb){
   const base0 = BASE_PRICES[pb.pkg] || 0;
@@ -38,20 +38,21 @@ function computeTotals(pb){
   }
 
   const total = base + extras;
-  // payMode: 'deposit' (25%), 'full' (5% off), 'pay_later' (+3% surcharge, enables Affirm)
+
   if (pb.payMode === 'full'){
     const save = Math.round(total * DISCOUNT_FULL);
-    return { total, dueNow: total - save, savings: save, surcharge: 0, payMethod: 'card' };
-  } else if (pb.payMode === 'pay_later'){
-    const add = Math.round(total * 0.03);
-    return { total, dueNow: total + add, savings: 0, surcharge: add, payMethod: 'affirm' };
-  } else {
-    return { total, dueNow: Math.round(total * 0.25), savings: 0, surcharge: 0, payMethod: 'card' };
+    return { total, dueNow: total - save, payMethod: 'card' };
   }
+  if (pb.payMode === 'pay_later'){
+    const add = Math.round(total * 0.03);
+    return { total, dueNow: total + add, payMethod: 'affirm' };  // full total + 3% now
+  }
+  // deposit (25%)
+  return { total, dueNow: Math.round(total * 0.25), payMethod: 'card' };
 }
 
 export default async function handler(req, res){
-  // Basic CORS
+  // CORS
   const allow = (process.env.ALLOWED_ORIGINS || '').split(',').map(s=>s.trim()).filter(Boolean);
   const origin = req.headers.origin || '';
   const okOrigin = allow.length ? allow.includes(origin) : true;
@@ -84,40 +85,29 @@ export default async function handler(req, res){
       "150-250-5h":"150–250 (5 hrs)",
       "250-350-6h":"250–350 (6 hrs)"
     };
-    const name = `Manna — ${barTitle} • ${labels[pb.pkg] || ''} • ${
-      pb.payMode === 'deposit' ? '25% deposit'
-        : pb.payMode === 'pay_later' ? 'Get Now, Pay Later (+3%)'
-        : 'Pay in full (5% off)'
-    }`;
-
-    // Allow coupons at checkout, and pre-apply if provided
-    const discounts = [];
-    if (pb.couponCode) {
-      // Try to find a Promotion Code that matches this code
-      const list = await stripe.promotionCodes.list({ code: String(pb.couponCode).trim(), active: true, limit: 1 });
-      const promo = list.data && list.data[0];
-      if (promo && promo.id) discounts.push({ promotion_code: promo.id });
-    }
+    const modeLabel =
+      pb.payMode === 'deposit' ? '25% deposit' :
+      pb.payMode === 'pay_later' ? 'Get Now, Pay Later (+3%)' :
+      'Pay in full (5% off)';
+    const name = `Manna — ${barTitle} • ${labels[pb.pkg] || ''} • ${modeLabel}`;
 
     const successUrl = (process.env.PUBLIC_URL || '') + (process.env.SUCCESS_PATH || '/thank-you') + '?booking={CHECKOUT_SESSION_ID}';
     const cancelUrl  = (process.env.PUBLIC_URL || '') + (process.env.CANCEL_PATH  || '/booking-canceled') + '?booking={CHECKOUT_SESSION_ID}';
 
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
-      // users can still add a coupon directly on Stripe Checkout
+      // Coupons only on Stripe page
       allow_promotion_codes: true,
-      // Enable Affirm when pay_later
+      // Enable Affirm only for pay_later
       payment_method_types: payMethod === 'affirm' ? ['card','affirm'] : ['card'],
       line_items: [{
         price_data: {
           currency: 'usd',
           product_data: { name },
-          unit_amount: cents(dueNow),
+          unit_amount: toCents(dueNow),
         },
         quantity: 1,
       }],
-      // apply pre-validated code if any
-      discounts: discounts.length ? discounts : undefined,
       success_url: successUrl,
       cancel_url: cancelUrl,
       metadata: {
@@ -132,7 +122,6 @@ export default async function handler(req, res){
         fountainType: pb.fountainType || '',
         total: String(total),
         dueNow: String(dueNow),
-        // date/time + contact
         dateISO: pb.dateISO || '',
         startISO: pb.startISO || '',
         fullName: pb.fullName || pb.name || '',
