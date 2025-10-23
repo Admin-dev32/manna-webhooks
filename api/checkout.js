@@ -3,16 +3,25 @@
 
 export const config = { runtime: 'nodejs' };   // valid on Vercel
 
-
 import Stripe from 'stripe';
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
+
+// Map your package to “live service hours” (matches your UI)
+function pkgToHours(pkg) {
+  if (pkg === '50-150-5h') return 2;
+  if (pkg === '150-250-5h') return 2.5;
+  if (pkg === '250-350-6h') return 3;
+  return 2;
+}
 
 // ====== Tu tabla de precios (idéntica a la de tu widget) ======
 const BASE_PRICES = { "50-150-5h": 550, "150-250-5h": 700, "250-350-6h": 900 };
 const SECOND_DISCOUNT = { "50-150-5h": 50, "150-250-5h": 75, "250-350-6h": 100 };
 const FOUNTAIN_PRICE = { "50": 350, "100": 450, "150": 550 };
 const FOUNTAIN_WHITE_UPCHARGE = 50;
-const DISCOUNT_FULL = 0.05;
+// ⚠️ Si quieres $20 plano (lo que me dijiste), usa:
+const FULL_FLAT_OFF = 20;
+// (Si te gustara 5%, cambia a: const DISCOUNT_FULL = 0.05)
 
 const BAR_META = {
   pancake:   { title: "🥞 Mini Pancake",  priceAdd: 0 },
@@ -21,7 +30,7 @@ const BAR_META = {
   tostiloco: { title: "🌶️ Tostiloco (Premium)", priceAdd: 50 }
 };
 
-function usd(n){ return Math.round(n * 100); } // cents
+function usd(n){ return Math.round(n * 100); } // to cents
 
 function computeTotals(pb){
   // pb: payload del cliente (verificado aquí)
@@ -44,8 +53,12 @@ function computeTotals(pb){
   const total = base + extras;
 
   if (pb.payMode === 'full'){
-    const save = Math.round(total * DISCOUNT_FULL);
-    return { total, dueNow: total - save, paySavings: save };
+    // 💸 Descuento plano de $20 (coincide con “$550 → $530”)
+    const dueNow = Math.max(total - FULL_FLAT_OFF, 0);
+    return { total, dueNow, paySavings: FULL_FLAT_OFF };
+    // 👉 Si prefieres 5%, reemplaza por:
+    // const save = Math.round(total * DISCOUNT_FULL);
+    // return { total, dueNow: total - save, paySavings: save };
   } else {
     return { total, dueNow: Math.round(total * 0.25), paySavings: 0 };
   }
@@ -97,7 +110,7 @@ export default async function handler(req, res){
         price_data: {
           currency: 'usd',
           product_data: { name },
-          unit_amount: usd(dueNow)
+          unit_amount: usd(dueNow) // ✅ exactamente lo que muestras (cents)
         },
         quantity: 1
       }],
@@ -125,7 +138,9 @@ export default async function handler(req, res){
         phone: pb.phone || '',
         venue: pb.venue || '',
         setup: pb.setup || '',
-        power: pb.power || ''
+        power: pb.power || '',
+        // 👇 FIX 1: faltaba la coma; además enviamos las horas para el Calendar.
+        hours: String(pkgToHours(pb.pkg))
       }
     });
 
