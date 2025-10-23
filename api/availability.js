@@ -4,23 +4,25 @@ export const config = { runtime: 'nodejs' };
 const HOURS_RANGE = { start: 9, end: 22 }; // 9am–10pm
 const PREP_HOURS = 1;
 const CLEAN_HOURS = 1;
+const DAY_CAP = 2; // max 2 bars per day
 
-function zonedStartISO(ymd, hour, tz){
-  const [y,m,d] = ymd.split('-').map(Number);
-  const guess = Date.UTC(y, m-1, d, hour, 0, 0);
+function zonedStartISO(ymd, hour, tz) {
+  // Build the exact local time in tz, then convert to a stable ISO.
+  const [y, m, d] = ymd.split('-').map(Number);
+  const guess = Date.UTC(y, m - 1, d, hour, 0, 0);
   const asDate = new Date(guess);
   const inTz = new Date(asDate.toLocaleString('en-US', { timeZone: tz }));
   const offsetMs = inTz.getTime() - asDate.getTime();
   return new Date(guess - offsetMs).toISOString();
 }
 
-export default async function handler(req, res){
+export default async function handler(req, res) {
   // CORS
-  const allow = (process.env.ALLOWED_ORIGINS || '').split(',').map(s=>s.trim()).filter(Boolean);
+  const allow = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
   const origin = req.headers.origin || '';
   const okOrigin = allow.length ? allow.includes(origin) : true;
 
-  if (req.method === 'OPTIONS'){
+  if (req.method === 'OPTIONS') {
     res.setHeader('Access-Control-Allow-Origin', okOrigin ? origin : '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -32,7 +34,7 @@ export default async function handler(req, res){
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   res.setHeader('Vary', 'Origin');
 
-  try{
+  try {
     const { date, hours } = req.query || {};
     const tz = process.env.TIMEZONE || 'America/Los_Angeles';
     const calId = process.env.CALENDAR_ID || 'primary';
@@ -40,23 +42,30 @@ export default async function handler(req, res){
 
     if (!date) return res.status(400).json({ error: 'date required (YYYY-MM-DD)' });
 
-    // --- Google auth (with newline fix) ---
+    // --- Google auth (supports JSON or split vars) ---
     const { google } = await import('googleapis');
-    const saRaw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '{}';
-    const sa = JSON.parse(saRaw);
-    if (sa.private_key) sa.private_key = sa.private_key.replace(/\\n/g, '\n');
+    let clientEmail, privateKey;
+    if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
+      const sa = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+      clientEmail = sa.client_email;
+      privateKey = (sa.private_key || '').replace(/\\n/g, '\n');
+    } else {
+      clientEmail = process.env.GCP_CLIENT_EMAIL;
+      privateKey = (process.env.GCP_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+    }
 
     const jwt = new google.auth.JWT(
-      sa.client_email,
+      clientEmail,
       null,
-      sa.private_key,
+      privateKey,
       ['https://www.googleapis.com/auth/calendar']
     );
     const calendar = google.calendar({ version: 'v3', auth: jwt });
 
     // Load all events for the date to compute overlaps
     const dayStart = zonedStartISO(date, 0, tz);
-    const dayEnd   = zonedStartISO(date, 23, tz);
+    const dayEnd = zonedStartISO(date, 23, tz);
+
     const rsp = await calendar.events.list({
       calendarId: calId,
       timeMin: dayStart,
@@ -65,13 +74,22 @@ export default async function handler(req, res){
       orderBy: 'startTime',
       maxResults: 100
     });
-    const events = (rsp.data.items || []).map(e => ({
+
+    // Ignore cancelled events; map to simple ranges
+    const items = (rsp.data.items || []).filter(e => e.status !== 'cancelled');
+    const events = items.map(e => ({
       start: new Date(e.start?.dateTime || e.start?.date),
-      end:   new Date(e.end?.dateTime   || e.end?.date)
+      end: new Date(e.end?.dateTime || e.end?.date)
     }));
 
+    // Daily capacity — max 2 bars per day
+    // If this calendar includes other personal events, you can filter by summary or extendedProperties here.
+    if (items.length >= DAY_CAP) {
+      return res.json({ slots: [] });
+    }
+
     const slots = [];
-    for (let h = HOURS_RANGE.start; h <= HOURS_RANGE.end; h++){
+    for (let h = HOURS_RANGE.start; h <= HOURS_RANGE.end; h++) {
       const startIso = zonedStartISO(date, h, tz);
       const start = new Date(startIso);
 
@@ -80,15 +98,16 @@ export default async function handler(req, res){
       if (start < now) continue;
 
       // Block window = prep + live + clean
-      const blockStart = new Date(start.getTime() - PREP_HOURS*3600e3);
-      const blockEnd   = new Date(start.getTime() + (liveHours*3600e3) + CLEAN_HOURS*3600e3);
+      const blockStart = new Date(start.getTime() - PREP_HOURS * 3600e3);
+      const blockEnd = new Date(start.getTime() + (liveHours * 3600e3) + CLEAN_HOURS * 3600e3);
 
-      const overlaps = events.some(ev => !(ev.end <= blockStart || ev.start >= blockEnd));
-      if (!overlaps) slots.push({ startISO: startIso });
+      // Reject if any existing event overlaps the full block
+      const collides = events.some(ev => !(ev.end <= blockStart || ev.start >= blockEnd));
+      if (!collides) slots.push({ startISO: startIso });
     }
 
     return res.json({ slots });
-  }catch(e){
+  } catch (e) {
     console.error('availability error', e);
     return res.status(500).json({ error: 'availability_failed', detail: e.message });
   }
