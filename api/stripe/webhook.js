@@ -2,7 +2,7 @@
 export const config = { api: { bodyParser: false }, runtime: 'nodejs' };
 
 import Stripe from 'stripe';
-import { getCalendarClient } from '../_google.js'; // <- ojo la ruta si estás en /api/stripe/
+import { getCalendarClient } from '../_google.js'; // <- OJO la ruta: estás en /api/stripe/
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
 
@@ -17,6 +17,13 @@ function pkgToHours(pkg) {
   return 2;
 }
 
+// Lee el RAW body sin 'micro'
+async function readRawBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
+
 function addHours(d, h) { return new Date(d.getTime() + h * 3600e3); }
 function blockWindow(startISO, liveHours) {
   const start = new Date(startISO);
@@ -26,17 +33,10 @@ function blockWindow(startISO, liveHours) {
 }
 function overlaps(aStart, aEnd, bStart, bEnd) { return !(aEnd <= bStart || aStart >= bEnd); }
 
-// 👇 UTILIDAD para leer el RAW body sin 'micro'
-async function readRawBody(req) {
-  const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
-  return Buffer.concat(chunks);
-}
-
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).send('Method not allowed');
 
-  // 1) Verificar firma de Stripe con RAW body (Node puro)
+  // 1) Verificar firma Stripe con RAW body (Node puro)
   let event;
   try {
     const sig = req.headers['stripe-signature'];
@@ -47,7 +47,7 @@ export default async function handler(req, res) {
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // 2) Solo nos interesa checkout.session.completed
+  // 2) Solo procesamos este tipo
   if (event.type !== 'checkout.session.completed') {
     return res.json({ received: true, ignored: event.type });
   }
@@ -68,7 +68,7 @@ export default async function handler(req, res) {
     }
     const { blockStart, blockEnd } = blockWindow(startISO, liveHrs);
 
-    // Cargar eventos del mismo día (para capacidad/traslape)
+    // 3) Cargar eventos del MISMO día (capacidad/traslape)
     const day = new Date(startISO);
     const dayStart = new Date(Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate(), 0,0,0));
     const dayEnd   = new Date(Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate(), 23,59,59));
@@ -83,17 +83,17 @@ export default async function handler(req, res) {
     });
     const items = list.data.items || [];
 
-    // Idempotencia por session.id
+    // Idempotencia: si ya creaste este pedido, actualiza
     const existing = items.find(e => e.extendedProperties?.private?.orderId === session.id);
 
-    // Capacidad: máximo 2 por día (no contar el propio si actualizamos)
+    // Capacidad: máximo 2 por día (sin contar el que vamos a actualizar)
     const countToday = items.filter(e => e.id !== existing?.id).length;
     if (!existing && countToday >= DAY_CAP) {
       console.warn('[webhook] capacity full (2/day). Skipping insert.');
       return res.json({ received: true, capacity: 'full' });
     }
 
-    // Traslape: no permitir 2 a la misma hora (considera prep+live+clean)
+    // Traslape: solo 1 bar al mismo tiempo (incluye prep+live+clean)
     const isOverlap = items.some(e => {
       const s = new Date(e.start?.dateTime || e.start?.date);
       const en = new Date(e.end?.dateTime || e.end?.date);
@@ -133,6 +133,6 @@ export default async function handler(req, res) {
     }
   } catch (err) {
     console.error('[webhook] handler error:', err);
-    return res.status(500).send('A server error has occurred');
+    return res.status(500).json({ error: 'server_error', detail: err.message });
   }
 }
