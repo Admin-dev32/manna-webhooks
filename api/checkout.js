@@ -14,26 +14,24 @@ function pkgToHours(pkg) {
   return 2;
 }
 
-// ====== Tu tabla de precios (idéntica a la de tu widget) ======
+// ====== Tabla de precios (idéntica al widget) ======
 const BASE_PRICES = { "50-150-5h": 550, "150-250-5h": 700, "250-350-6h": 900 };
 const SECOND_DISCOUNT = { "50-150-5h": 50, "150-250-5h": 75, "250-350-6h": 100 };
 const FOUNTAIN_PRICE = { "50": 350, "100": 450, "150": 550 };
 const FOUNTAIN_WHITE_UPCHARGE = 50;
-// ⚠️ Si quieres $20 plano (lo que me dijiste), usa:
-const FULL_FLAT_OFF = 20;
-// (Si te gustara 5%, cambia a: const DISCOUNT_FULL = 0.05)
+const FULL_FLAT_OFF = 20; // $20 off when paying in full (matches frontend)
 
 const BAR_META = {
   pancake:   { title: "🥞 Mini Pancake",  priceAdd: 0 },
   esquites:  { title: "🌽 Esquites",      priceAdd: 0 },
   maruchan:  { title: "🍜 Maruchan",      priceAdd: 0 },
-  tostiloco: { title: "🌶️ Tostiloco (Premium)", priceAdd: 50 }
+  tostiloco: { title: "🌶️ Tostiloco (Premium)", priceAdd: 50 },
+  snack:     { title: "🍭 Manna Snack Bar — “La Clásica”", priceAdd: 0 } // NEW standard bar
 };
 
-function usd(n){ return Math.round(n * 100); } // to cents
+function usd(n){ return Math.round(n * 100); } // dollars → cents
 
 function computeTotals(pb){
-  // pb: payload del cliente (verificado aquí)
   const base0 = BASE_PRICES[pb.pkg] || 0;
   const addMain = (BAR_META[pb.mainBar]?.priceAdd) || 0;
   const base = base0 + addMain;
@@ -53,12 +51,8 @@ function computeTotals(pb){
   const total = base + extras;
 
   if (pb.payMode === 'full'){
-    // 💸 Descuento plano de $20 (coincide con “$550 → $530”)
     const dueNow = Math.max(total - FULL_FLAT_OFF, 0);
     return { total, dueNow, paySavings: FULL_FLAT_OFF };
-    // 👉 Si prefieres 5%, reemplaza por:
-    // const save = Math.round(total * DISCOUNT_FULL);
-    // return { total, dueNow: total - save, paySavings: save };
   } else {
     return { total, dueNow: Math.round(total * 0.25), paySavings: 0 };
   }
@@ -99,8 +93,11 @@ export default async function handler(req, res){
     const labels = { "50-150-5h":"50–150 (5 hrs)", "150-250-5h":"150–250 (5 hrs)", "250-350-6h":"250–350 (6 hrs)" };
     const name = `Manna — ${barTitle} • ${labels[pb.pkg] || ''} • ${pb.payMode === 'full' ? 'Pay in full' : '25% deposit'}`;
 
-    const successUrl = (process.env.PUBLIC_URL || '') + (process.env.SUCCESS_PATH || 'https://mannasnackbars.com') + '?booking={CHECKOUT_SESSION_ID}';
-    const cancelUrl  = (process.env.PUBLIC_URL || '') + (process.env.CANCEL_PATH  || 'https://mannasnackbars.com') + '?booking={CHECKOUT_SESSION_ID}';
+    // ✅ Always send users to homepage after success/cancel.
+    // If PUBLIC_URL exists, use it; otherwise default to your domain.
+    const BASE_URL = (process.env.PUBLIC_URL || 'https://mannasnackbars.com').replace(/\/+$/, '');
+    const successUrl = `${BASE_URL}/`;
+    const cancelUrl  = `${BASE_URL}/`;
 
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
@@ -110,14 +107,14 @@ export default async function handler(req, res){
         price_data: {
           currency: 'usd',
           product_data: { name },
-          unit_amount: usd(dueNow) // ✅ exactamente lo que muestras (cents)
+          unit_amount: usd(dueNow) // show exactly what you charge now
         },
         quantity: 1
       }],
       success_url: successUrl,
       cancel_url: cancelUrl,
       metadata: {
-        // guardamos todo lo necesario para finalizar en el webhook
+        // data needed for webhook -> Google Calendar
         pkg: pb.pkg,
         mainBar: pb.mainBar,
         payMode: pb.payMode,
@@ -130,7 +127,7 @@ export default async function handler(req, res){
         total: String(total),
         dueNow: String(dueNow),
 
-        // datos del cliente/booking
+        // customer / booking
         dateISO: pb.dateISO || '',
         startISO: pb.startISO || '',
         fullName: pb.fullName || pb.name || '',
@@ -139,8 +136,7 @@ export default async function handler(req, res){
         venue: pb.venue || '',
         setup: pb.setup || '',
         power: pb.power || '',
-        // 👇 FIX 1: faltaba la coma; además enviamos las horas para el Calendar.
-        hours: String(pkgToHours(pb.pkg))
+        hours: String(pkgToHours(pb.pkg)) // used by calendar block length
       }
     });
 
