@@ -1,147 +1,152 @@
-// /api/checkout.js
-// Creates a Stripe Checkout session. Supports:
-// - payMode: 'deposit' (25%), 'full' (100%), 'affirm' (full + 3% fee)
-// - Promotion codes on Stripe page (allow_promotion_codes: true)
-// - Not embedded: your frontend redirects the top window (see section 2)
-
-export const config = { runtime: 'nodejs' };
+// /api/webhook.js
+export const config = { api: { bodyParser: false }, runtime: 'nodejs' };
 
 import Stripe from 'stripe';
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+import { buffer } from 'micro';
+import { getCalendarClient } from './_google.js'; // you already have this helper
+// _google.js uses GCP_CLIENT_EMAIL + GCP_PRIVATE_KEY and builds the client. :contentReference[oaicite:6]{index=6}
 
-// ===== PRICING =====
-const BASE_PRICES = { "50-150-5h": 550, "150-250-5h": 700, "250-350-6h": 900 };
-const SECOND_DISCOUNT = { "50-150-5h": 50, "150-250-5h": 75, "250-350-6h": 100 };
-const FOUNTAIN_PRICE = { "50": 350, "100": 450, "150": 550 };
-const FOUNTAIN_WHITE_UPCHARGE = 50;
-const DISCOUNT_FULL = 0.05;
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
 
-const BAR_META = {
-  pancake:   { title: "🥞 Mini Pancake",  priceAdd: 0 },
-  esquites:  { title: "🌽 Esquites",      priceAdd: 0 },
-  maruchan:  { title: "🍜 Maruchan",      priceAdd: 0 },
-  tostiloco: { title: "🌶️ Tostiloco (Premium)", priceAdd: 50 }
-};
+const PREP_HOURS = 1;
+const CLEAN_HOURS = 1;
+const DAY_CAP = 2;
 
-function usd(n){ return Math.round(n * 100); }
-
-function computeTotals(pb){
-  const base0 = BASE_PRICES[pb.pkg] || 0;
-  const addMain = (BAR_META[pb.mainBar]?.priceAdd) || 0;
-  const base = base0 + addMain;
-
-  let extras = 0;
-  if (pb.secondEnabled){
-    const b = BASE_PRICES[pb.secondSize] || 0;
-    const d = SECOND_DISCOUNT[pb.secondSize] || 0;
-    extras += Math.max(b - d, 0);
-  }
-  if (pb.fountainEnabled){
-    const b = FOUNTAIN_PRICE[pb.fountainSize] || 0;
-    const up = (pb.fountainType === 'white' || pb.fountainType === 'mixed') ? FOUNTAIN_WHITE_UPCHARGE : 0;
-    extras += (b + up);
-  }
-  const total = base + extras;
-
-  if (pb.payMode === 'full'){
-    const save = Math.round(total * DISCOUNT_FULL);
-    return { total, dueNow: total - save, paySavings: save, mode: 'full' };
-  }
-  if (pb.payMode === 'affirm'){
-    // Full total + 3% fee
-    const fee = Math.round(total * 0.03);
-    return { total: total + fee, dueNow: total + fee, paySavings: 0, mode: 'affirm' };
-  }
-  // default: deposit 25%
-  return { total, dueNow: Math.round(total * 0.25), paySavings: 0, mode: 'deposit' };
+function pkgToHours(pkg) {
+  if (pkg === '50-150-5h') return 2;
+  if (pkg === '150-250-5h') return 2.5;
+  if (pkg === '250-350-6h') return 3;
+  return 2;
 }
 
-export default async function handler(req, res){
-  // CORS
-  const allowList = (process.env.ALLOWED_ORIGINS || '').split(',').map(s=>s.trim()).filter(Boolean);
-  const origin = req.headers.origin || '';
-  const okOrigin = allowList.length ? allowList.includes(origin) : true;
+function ymdFromISO(iso, tz) {
+  // Convert ISO to Y-M-D in the site timezone to group per-day reliably
+  const d = new Date(iso);
+  const s = d.toLocaleString('en-US', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' });
+  const [m, day, y] = s.split(/[\/, ]+/).map(Number);
+  return `${y}-${String(m).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
+}
 
-  if (req.method === 'OPTIONS'){
-    res.setHeader('Access-Control-Allow-Origin', okOrigin ? origin : '*');
-    res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    res.setHeader('Vary', 'Origin');
-    return res.status(204).end();
+function addHours(date, h) {
+  return new Date(date.getTime() + h * 3600e3);
+}
+
+function blockWindow(startISO, liveHours) {
+  const start = new Date(startISO);
+  const blockStart = addHours(start, -PREP_HOURS);
+  const blockEnd   = addHours(start, liveHours + CLEAN_HOURS);
+  return { blockStart, blockEnd };
+}
+
+function overlaps(aStart, aEnd, bStart, bEnd) {
+  return !(aEnd <= bStart || aStart >= bEnd);
+}
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') return res.status(405).send('Method not allowed');
+
+  // 1) Verify Stripe signature with RAW body
+  let event;
+  try {
+    const sig = req.headers['stripe-signature'];
+    const buf = await buffer(req);
+    event = stripe.webhooks.constructEvent(buf, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('Stripe webhook signature failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
   }
-  res.setHeader('Access-Control-Allow-Origin', okOrigin ? origin : '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.setHeader('Vary', 'Origin');
 
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+  // 2) Only handle completed checkout
+  if (event.type !== 'checkout.session.completed') {
+    return res.json({ received: true });
+  }
 
-  try{
-    const pb = req.body || {};
-    if (!pb.pkg || !pb.mainBar || !pb.payMode) {
-      return res.status(400).json({ error: 'Missing fields (pkg, mainBar, payMode)' });
+  const session = event.data.object;
+  const md = session.metadata || {};
+
+  try {
+    const tz = process.env.TIMEZONE || 'America/Los_Angeles';
+    const calId = process.env.CALENDAR_ID || 'primary';
+    const calendar = getCalendarClient(); // existing helper uses your env vars. :contentReference[oaicite:7]{index=7}
+
+    // 3) Build timing (use hours from metadata, fallback from pkg)
+    const startISO = md.startISO;
+    const liveHours = Number(md.hours || 0) || pkgToHours(md.pkg);
+    if (!startISO || !liveHours) {
+      console.warn('Missing startISO/hours — skip calendar insert');
+      return res.json({ received: true, skipped: true });
+    }
+    const { blockStart, blockEnd } = blockWindow(startISO, liveHours);
+
+    // 4) Load same-day events to enforce capacity & overlap
+    const ymd = ymdFromISO(startISO, tz);
+    const dayStart = new Date(`${ymd}T00:00:00Z`);
+    const dayEnd   = new Date(`${ymd}T23:59:59Z`);
+
+    const list = await calendar.events.list({
+      calendarId: calId,
+      timeMin: dayStart.toISOString(),
+      timeMax: dayEnd.toISOString(),
+      singleEvents: true,
+      orderBy: 'startTime',
+      maxResults: 100
+    });
+    const items = list.data.items || [];
+
+    // Upsert guard: if we already created for this session.id, patch it instead of adding
+    const existing = items.find(e =>
+      e.extendedProperties?.private?.orderId === session.id
+    );
+
+    // CAPACITY: at most 2 bars in the same day
+    // If existing belongs to this order, exclude it from the count.
+    const countToday = items.filter(e => e.id !== existing?.id).length;
+    if (!existing && countToday >= DAY_CAP) {
+      console.warn('Day capacity reached (2). Skipping insert.');
+      return res.json({ received: true, capacity: 'full' });
     }
 
-    const { total, dueNow, mode } = computeTotals(pb);
-
-    const barTitle = (BAR_META[pb.mainBar]?.title) || 'Snack Bar';
-    const labels = { "50-150-5h":"50–150 (5 hrs)", "150-250-5h":"150–250 (5 hrs)", "250-350-6h":"250–350 (6 hrs)" };
-
-    let paymentLabel = '25% deposit';
-    if (mode === 'full') paymentLabel = 'Pay in full (5% off)';
-    if (mode === 'affirm') paymentLabel = 'Pay over time (Affirm)';
-
-    const name = `Manna — ${barTitle} • ${labels[pb.pkg] || ''} • ${paymentLabel}`;
-
-    const successUrl = (process.env.PUBLIC_URL || '') + (process.env.SUCCESS_PATH || '/thank-you') + '?booking={CHECKOUT_SESSION_ID}';
-    const cancelUrl  = (process.env.PUBLIC_URL || '') + (process.env.CANCEL_PATH  || '/booking-canceled') + '?booking={CHECKOUT_SESSION_ID}';
-
-    // Payment method types
-    // For Affirm we force show Affirm (plus card fallback).
-    const methodTypes = mode === 'affirm' ? ['affirm', 'card'] : ['card'];
-
-    const session = await stripe.checkout.sessions.create({
-      mode: 'payment',
-      // customer_creation could be 'always' if you want a customer created.
-      payment_method_types: methodTypes,
-      allow_promotion_codes: true, // user applies coupon at Stripe
-      line_items: [{
-        price_data: {
-          currency: 'usd',
-          product_data: { name },
-          unit_amount: usd(dueNow)
-        },
-        quantity: 1
-      }],
-      success_url: successUrl,
-      cancel_url: cancelUrl,
-      // Pass everything your webhook needs:
-      metadata: {
-        pkg: pb.pkg,
-        mainBar: pb.mainBar,
-        payMode: pb.payMode,         // 'deposit' | 'full' | 'affirm'
-        secondEnabled: String(!!pb.secondEnabled),
-        secondBar: pb.secondBar || '',
-        secondSize: pb.secondSize || '',
-        fountainEnabled: String(!!pb.fountainEnabled),
-        fountainSize: pb.fountainSize || '',
-        fountainType: pb.fountainType || '',
-        total: String(total),
-        dueNow: String(dueNow),
-        dateISO: pb.dateISO || '',
-        startISO: pb.startISO || '',
-        fullName: pb.fullName || pb.name || '',
-        email: pb.email || '',
-        phone: pb.phone || '',
-        venue: pb.venue || '',
-        setup: pb.setup || '',
-        power: pb.power || ''
-      }
+    // OVERLAP: only 1 bar at the same time (block includes prep+live+clean)
+    const overlapping = items.some(e => {
+      const s = new Date(e.start?.dateTime || e.start?.date);
+      const en = new Date(e.end?.dateTime || e.end?.date);
+      return overlaps(blockStart, blockEnd, s, en) && e.id !== existing?.id;
     });
+    if (!existing && overlapping) {
+      console.warn('Time overlap with another event. Skipping insert.');
+      return res.json({ received: true, conflict: 'overlap' });
+    }
 
-    return res.status(200).json({ url: session.url });
-  }catch(e){
-    console.error('checkout error', e);
-    return res.status(500).json({ error: 'Checkout failed', detail: e.message });
+    // 5) Create or update the event (idempotent via orderId)
+    const requestBody = {
+      summary: `Manna Snack Bars — ${md.mainBar || 'Booking'} (${md.pkg || ''})`,
+      description: [
+        `Name: ${md.fullName || ''}`,
+        md.email ? `Email: ${md.email}` : '',
+        md.phone ? `Phone: ${md.phone}` : '',
+        `Package: ${md.pkg || ''}`,
+        `Bar: ${md.mainBar || ''}`,
+        `Date: ${md.dateISO || ''}`,
+        `Start: ${startISO}`,
+        `Service hours: ${liveHours}`,
+        `Stripe session: ${session.id}`
+      ].filter(Boolean).join('\n'),
+      location: md.venue || '',
+      start: { dateTime: blockStart.toISOString(), timeZone: tz },
+      end:   { dateTime: blockEnd.toISOString(),   timeZone: tz },
+      attendees: md.email ? [{ email: md.email, displayName: md.fullName || '' }] : [],
+      extendedProperties: { private: { orderId: session.id } },
+    };
+
+    if (existing) {
+      await calendar.events.patch({ calendarId: calId, eventId: existing.id, requestBody });
+      return res.json({ received: true, updated: true });
+    } else {
+      await calendar.events.insert({ calendarId: calId, requestBody });
+      return res.json({ received: true, created: true });
+    }
+  } catch (err) {
+    console.error('Webhook handler error:', err);
+    return res.status(500).send('Webhook handler error');
   }
 }
