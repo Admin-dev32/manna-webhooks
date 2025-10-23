@@ -1,7 +1,7 @@
 // /api/availability.js
 export const config = { runtime: 'nodejs' };
 
-const HOURS_RANGE = { start: 9, end: 22 }; // 9am–10pm
+const HOURS_RANGE = { start: 9, end: 22 }; // 9am–10pm (start of service window)
 const PREP_HOURS = 1;
 const CLEAN_HOURS = 1;
 const DAY_CAP = 2; // max 2 bars per day
@@ -64,7 +64,7 @@ export default async function handler(req, res) {
 
     // Load all events for the date to compute overlaps
     const dayStart = zonedStartISO(date, 0, tz);
-    const dayEnd = zonedStartISO(date, 23, tz);
+    const dayEnd   = zonedStartISO(date, 23, tz);
 
     const rsp = await calendar.events.list({
       calendarId: calId,
@@ -75,31 +75,33 @@ export default async function handler(req, res) {
       maxResults: 100
     });
 
-    // Ignore cancelled events; map to simple ranges
+    // Ignore cancelled events
     const items = (rsp.data.items || []).filter(e => e.status !== 'cancelled');
-    const events = items.map(e => ({
-      start: new Date(e.start?.dateTime || e.start?.date),
-      end: new Date(e.end?.dateTime || e.end?.date)
-    }));
 
-    // Daily capacity — max 2 bars per day
-    // If this calendar includes other personal events, you can filter by summary or extendedProperties here.
+    // ✅ Daily capacity — max 2 bars per day
+    // If this calendar includes other personal events, filter by summary or extendedProperties here.
     if (items.length >= DAY_CAP) {
       return res.json({ slots: [] });
     }
+
+    // Map to simple ranges for collision checks
+    const events = items.map(e => ({
+      start: new Date(e.start?.dateTime || e.start?.date),
+      end:   new Date(e.end?.dateTime   || e.end?.date)
+    }));
 
     const slots = [];
     for (let h = HOURS_RANGE.start; h <= HOURS_RANGE.end; h++) {
       const startIso = zonedStartISO(date, h, tz);
       const start = new Date(startIso);
 
-      // No past times
+      // Skip past times
       const now = new Date();
       if (start < now) continue;
 
-      // Block window = prep + live + clean
+      // Full block = 1h prep + live service + 1h cleanup
       const blockStart = new Date(start.getTime() - PREP_HOURS * 3600e3);
-      const blockEnd = new Date(start.getTime() + (liveHours * 3600e3) + CLEAN_HOURS * 3600e3);
+      const blockEnd   = new Date(start.getTime() + (liveHours * 3600e3) + CLEAN_HOURS * 3600e3);
 
       // Reject if any existing event overlaps the full block
       const collides = events.some(ev => !(ev.end <= blockStart || ev.start >= blockEnd));
