@@ -99,8 +99,8 @@ export default async function handler(req, res){
     const labels = { "50-150-5h":"50–150 (5 hrs)", "150-250-5h":"150–250 (5 hrs)", "250-350-6h":"250–350 (6 hrs)" };
     const name = `Manna — ${barTitle} • ${labels[pb.pkg] || ''} • ${pb.payMode === 'full' ? 'Pay in full' : '25% deposit'}`;
 
-    const successUrl = (process.env.PUBLIC_URL || '') + (process.env.SUCCESS_PATH || '/thank-you') + '?booking={CHECKOUT_SESSION_ID}';
-    const cancelUrl  = (process.env.PUBLIC_URL || '') + (process.env.CANCEL_PATH  || '/booking-canceled') + '?booking={CHECKOUT_SESSION_ID}';
+    const successUrl = (process.env.PUBLIC_URL || '') + (process.env.SUCCESS_PATH || 'https://mannasnackbars.com') + '?booking={CHECKOUT_SESSION_ID}';
+    const cancelUrl  = (process.env.PUBLIC_URL || '') + (process.env.CANCEL_PATH  || 'https://mannasnackbars.com') + '?booking={CHECKOUT_SESSION_ID}';
 
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
