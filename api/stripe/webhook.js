@@ -1,9 +1,8 @@
-// /api/webhook.js
+// /api/stripe/webhook.js
 export const config = { api: { bodyParser: false }, runtime: 'nodejs' };
 
 import Stripe from 'stripe';
-import { buffer } from 'micro';
-import { getCalendarClient } from './_google.js';
+import { getCalendarClient } from '../_google.js'; // <- ojo la ruta si estás en /api/stripe/
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
 
@@ -27,17 +26,24 @@ function blockWindow(startISO, liveHours) {
 }
 function overlaps(aStart, aEnd, bStart, bEnd) { return !(aEnd <= bStart || aStart >= bEnd); }
 
+// 👇 UTILIDAD para leer el RAW body sin 'micro'
+async function readRawBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).send('Method not allowed');
 
-  // 1) Verificar firma de Stripe con RAW body
+  // 1) Verificar firma de Stripe con RAW body (Node puro)
   let event;
   try {
     const sig = req.headers['stripe-signature'];
-    const buf = await buffer(req);
+    const buf = await readRawBody(req);
     event = stripe.webhooks.constructEvent(buf, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
-    console.error('[webhook] signature failed:', err.message);
+    console.error('[webhook] signature/parse failed:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
@@ -52,10 +58,9 @@ export default async function handler(req, res) {
   try {
     const tz = process.env.TIMEZONE || 'America/Los_Angeles';
     const calId = process.env.CALENDAR_ID || 'primary';
-    const calendar = getCalendarClient();
+    const calendar = getCalendarClient(); // usa tus GCP_* de _google.js
 
-    // 3) Construir horas
-    const startISO = md.startISO;                       // ej: "2025-10-29T16:00:00.000Z"
+    const startISO = md.startISO;
     const liveHrs  = Number(md.hours || 0) || pkgToHours(md.pkg);
     if (!startISO || !liveHrs) {
       console.warn('[webhook] missing startISO/hours — skipping calendar insert');
@@ -63,7 +68,7 @@ export default async function handler(req, res) {
     }
     const { blockStart, blockEnd } = blockWindow(startISO, liveHrs);
 
-    // 4) Cargar eventos del mismo día para verificar capacidad y traslape
+    // Cargar eventos del mismo día (para capacidad/traslape)
     const day = new Date(startISO);
     const dayStart = new Date(Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate(), 0,0,0));
     const dayEnd   = new Date(Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate(), 23,59,59));
@@ -78,17 +83,17 @@ export default async function handler(req, res) {
     });
     const items = list.data.items || [];
 
-    // Idempotencia: si ya existe uno con este session.id, lo actualizamos
+    // Idempotencia por session.id
     const existing = items.find(e => e.extendedProperties?.private?.orderId === session.id);
 
-    // Capacidad diaria: máx 2 (sin contar el existente si lo estamos actualizando)
+    // Capacidad: máximo 2 por día (no contar el propio si actualizamos)
     const countToday = items.filter(e => e.id !== existing?.id).length;
     if (!existing && countToday >= DAY_CAP) {
       console.warn('[webhook] capacity full (2/day). Skipping insert.');
       return res.json({ received: true, capacity: 'full' });
     }
 
-    // Traslape: no permitir solaparse con otra barra (bloque = prep+live+clean)
+    // Traslape: no permitir 2 a la misma hora (considera prep+live+clean)
     const isOverlap = items.some(e => {
       const s = new Date(e.start?.dateTime || e.start?.date);
       const en = new Date(e.end?.dateTime || e.end?.date);
@@ -99,7 +104,6 @@ export default async function handler(req, res) {
       return res.json({ received: true, conflict: 'overlap' });
     }
 
-    // 5) Crear o actualizar (idempotente por orderId)
     const requestBody = {
       summary: `Manna Snack Bars — ${md.mainBar || 'Booking'} (${md.pkg || ''})`,
       description: [
